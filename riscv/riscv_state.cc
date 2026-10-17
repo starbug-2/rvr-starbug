@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <vector>
@@ -482,6 +483,7 @@ void RiscVState::LoadMemory(const Instruction* inst, uint64_t address,
          inst->address(), inst);
     return;
   }
+  if (in_bundle_) bundle_addresses_.push_back(address);
   memory_->Load(address, db, child_inst, context);
 }
 
@@ -505,7 +507,32 @@ void RiscVState::StoreMemory(const Instruction* inst, uint64_t address,
          inst->address(), inst);
     return;
   }
+  if (in_bundle_) bundle_addresses_.push_back(address);
   memory_->Store(address, db);
+}
+
+void RiscVState::EndBundle() {
+  in_bundle_ = false;
+  if (bundle_addresses_.size() < 2) return;
+  pending_multi_mem_bundles_++;
+  if (bank_pair_log_enabled_) {
+    bank_pair_log_[{bundle_addresses_[0], bundle_addresses_[1]}]++;
+  }
+  if (dmem_bank_mode_ == DmemBankMode::kNone) return;
+  uint64_t per_bank[2] = {0, 0};
+  for (uint64_t address : bundle_addresses_) {
+    int bank = dmem_bank_mode_ == DmemBankMode::kSplit
+                   ? (address >= dmem_bank_param_ ? 1 : 0)
+                   : static_cast<int>((address >> dmem_bank_param_) & 1);
+    per_bank[bank]++;
+  }
+  // One access per bank per cycle: every extra access to the busiest bank
+  // is serialized behind the first.
+  uint64_t busiest = per_bank[0] > per_bank[1] ? per_bank[0] : per_bank[1];
+  if (busiest > 1) {
+    pending_bank_conflicts_++;
+    pending_bank_stall_cycles_ += busiest - 1;
+  }
 }
 
 void RiscVState::StoreMemory(const Instruction* inst, DataBuffer* address_db,
@@ -811,6 +838,19 @@ InterruptCode RiscVState::PickInterrupt(uint32_t interrupts) {
     return InterruptCode::kUserTimerInterrupt;
 
   return InterruptCode::kNone;
+}
+
+absl::Status RiscVState::WriteBankPairLog(const std::string& path) const {
+  std::FILE* f = std::fopen(path.c_str(), "w");
+  if (f == nullptr) return absl::InternalError("cannot open " + path);
+  for (const auto& [pair, count] : bank_pair_log_) {
+    std::fprintf(f, "0x%llx 0x%llx %llu\n",
+                 static_cast<unsigned long long>(pair.first),
+                 static_cast<unsigned long long>(pair.second),
+                 static_cast<unsigned long long>(count));
+  }
+  std::fclose(f);
+  return absl::OkStatus();
 }
 
 }  // namespace riscv

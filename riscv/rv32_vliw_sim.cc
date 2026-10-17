@@ -156,6 +156,15 @@ ABSL_FLAG(bool, quiet, false, "Suppress informational and warning messages");
 ABSL_FLAG(std::string, icache, "", "Instruction cache configuration");
 ABSL_FLAG(std::string, dcache, "", "Data cache configuration");
 
+// STARBUG experiment hooks.
+ABSL_FLAG(std::string, pc_histogram, "",
+          "Write per-address execution counts to this file");
+ABSL_FLAG(std::string, dmem_banks, "none",
+          "Banked data memory model for bundles: none | split:<address> | "
+          "interleave:<address bit>");
+ABSL_FLAG(std::string, bank_pair_log, "",
+          "Write the address pairs of every two-memory-op bundle to this file");
+
 constexpr char kStackEndSymbolName[] = "__stack_end";
 constexpr char kStackSizeSymbolName[] = "__stack_size";
 
@@ -296,6 +305,28 @@ int main(int argc, char** argv) {
   }
 
   RiscVTop riscv_top("RiscV32Sim", &rv_state, rv_decoder);
+
+  // Configure the STARBUG experiment hooks.
+  {
+    std::string banks = absl::GetFlag(FLAGS_dmem_banks);
+    std::string mode = banks.substr(0, banks.find(':'));
+    uint64_t param = 0;
+    if (banks.find(':') != std::string::npos) {
+      param = std::stoull(banks.substr(banks.find(':') + 1), nullptr, 0);
+    }
+    if (mode == "split") {
+      rv_state.SetDmemBanks(RiscVState::DmemBankMode::kSplit, param);
+    } else if (mode == "interleave") {
+      rv_state.SetDmemBanks(RiscVState::DmemBankMode::kInterleave, param);
+    } else if (mode != "none") {
+      std::cerr << "Unknown --dmem_banks value: " << banks << std::endl;
+      return -1;
+    }
+  }
+  if (!absl::GetFlag(FLAGS_pc_histogram).empty()) {
+    riscv_top.EnablePcHistogram();
+  }
+  if (!absl::GetFlag(FLAGS_bank_pair_log).empty()) rv_state.EnableBankPairLog();
 
   if (!absl::GetFlag(FLAGS_icache).empty()) {
     ComponentValueEntry icache_value;
@@ -491,6 +522,17 @@ int main(int argc, char** argv) {
     auto wait_status = riscv_top.Wait();
     if (!wait_status.ok()) {
       std::cerr << wait_status.message() << std::endl;
+    }
+
+    if (!absl::GetFlag(FLAGS_pc_histogram).empty()) {
+      auto hist_status =
+          riscv_top.WritePcHistogram(absl::GetFlag(FLAGS_pc_histogram));
+      if (!hist_status.ok()) std::cerr << hist_status.message() << std::endl;
+    }
+    if (!absl::GetFlag(FLAGS_bank_pair_log).empty()) {
+      auto log_status =
+          rv_state.WriteBankPairLog(absl::GetFlag(FLAGS_bank_pair_log));
+      if (!log_status.ok()) std::cerr << log_status.message() << std::endl;
     }
 
     auto t1 = absl::Now();

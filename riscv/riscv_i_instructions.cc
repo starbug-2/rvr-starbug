@@ -336,12 +336,17 @@ void RiscVIBlt(const Instruction* instruction) {
 
 void RiscVExVLIW(const Instruction* instruction) {
   // LOG(INFO) << " executing VLIW parent";
+  // Bracket the children so the state can check the bundle's data accesses
+  // against the banked-memory model.
+  auto* state = static_cast<RiscVState*>(instruction->state());
+  state->BeginBundle();
   Instruction* child = instruction->child();
   while (child != nullptr) {
     // LOG(INFO) << " -> executing child opcode: " << child->opcode();
     child->Execute();
     child = child->next();
   }
+  state->EndBundle();
 }
 
 void RiscVIBltu(const Instruction* instruction) {
@@ -366,12 +371,17 @@ namespace RV64 {
 
 void RiscVExVLIW(const Instruction* instruction) {
   // LOG(INFO) << " executing VLIW parent";
+  // Bracket the children so the state can check the bundle's data accesses
+  // against the banked-memory model.
+  auto* state = static_cast<RiscVState*>(instruction->state());
+  state->BeginBundle();
   Instruction* child = instruction->child();
   while (child != nullptr) {
     // LOG(INFO) << " -> executing child opcode: " << child->opcode();
     child->Execute();
     child = child->next();
   }
+  state->EndBundle();
 }
 
 

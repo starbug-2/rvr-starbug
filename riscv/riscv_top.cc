@@ -16,10 +16,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>  // NOLINT: third_party code.
 #include <utility>
+#include <vector>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/functional/bind_front.h"
@@ -89,6 +91,9 @@ RiscVTop::RiscVTop(std::string name, RiscVState* state,
       rv_decoder_(decoder),
       counter_num_instructions_("num_instructions", 0),
       counter_num_cycles_("num_cycles", 0),
+      counter_multi_mem_bundles_("num_multi_mem_bundles", 0),
+      counter_bank_conflicts_("num_bank_conflicts", 0),
+      counter_bank_stall_cycles_("num_bank_stall_cycles", 0),
       icache_config_("icache", ""),
       dcache_config_("dcache", "") {
   CHECK_OK(AddConfig(&icache_config_));
@@ -134,6 +139,9 @@ void RiscVTop::Initialize() {
       << "Failed to register instruction counter";
   CHECK_OK(AddCounter(&counter_num_cycles_))
       << "Failed to register cycle counter";
+  CHECK_OK(AddCounter(&counter_multi_mem_bundles_));
+  CHECK_OK(AddCounter(&counter_bank_conflicts_));
+  CHECK_OK(AddCounter(&counter_bank_stall_cycles_));
   // Register opcode counters.
   int num_opcodes = rv_decoder_->GetNumOpcodes();
   counter_opcode_.resize(num_opcodes);
@@ -408,6 +416,17 @@ absl::Status RiscVTop::Run() {
           state_->TakeAvailableInterrupt(epc);
         }
       } while (!executed);
+      // Banked data memory: a bundle whose memory ops collided on a bank
+      // costs extra cycles (charged to mcycle as well).
+      if (state_->has_pending_bank_stats()) {
+        uint64_t multi, conflicts, stalls;
+        state_->TakeBankStats(multi, conflicts, stalls);
+        counter_multi_mem_bundles_.Increment(multi);
+        counter_bank_conflicts_.Increment(conflicts);
+        counter_bank_stall_cycles_.Increment(stalls);
+        counter_num_cycles_.Increment(stalls);
+      }
+      if (pc_histogram_enabled_) pc_histogram_[pc]++;
       // Update counters.
       counter_opcode_[inst->opcode()].Increment(1);
       counter_num_instructions_.Increment(1);
@@ -912,6 +931,22 @@ void RiscVTop::DisableStatistics() {
 
 void RiscVTop::ICacheFetch(uint64_t address) {
   icache_->Load(address, inst_db_, nullptr, nullptr);
+}
+
+absl::Status RiscVTop::WritePcHistogram(const std::string& path) const {
+  std::vector<std::pair<uint64_t, uint64_t>> entries(pc_histogram_.begin(),
+                                                     pc_histogram_.end());
+  std::sort(entries.begin(), entries.end());
+  std::FILE* f = std::fopen(path.c_str(), "w");
+  if (f == nullptr) {
+    return absl::InternalError(absl::StrCat("cannot open ", path));
+  }
+  for (const auto& [address, count] : entries) {
+    std::fprintf(f, "0x%llx %llu\n", static_cast<unsigned long long>(address),
+                 static_cast<unsigned long long>(count));
+  }
+  std::fclose(f);
+  return absl::OkStatus();
 }
 
 }  // namespace riscv

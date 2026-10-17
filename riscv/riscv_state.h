@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -253,6 +254,41 @@ class RiscVState : public ArchState {
   void StoreMemory(const Instruction* inst, uint64_t address, DataBuffer* db);
   void StoreMemory(const Instruction* inst, DataBuffer* address_db,
                    DataBuffer* mask_db, int el_size, DataBuffer* db);
+
+  // STARBUG banked data-memory model. Data memory is split into two banks;
+  // two memory operations in one bundle proceed in parallel only if they hit
+  // different banks, otherwise each extra access to a bank costs one stall
+  // cycle. kNone models ideal multi-ported memory (no stalls). kSplit puts
+  // addresses >= param in bank 1 (upper/lower halves); kInterleave uses
+  // address bit `param` as the bank number.
+  enum class DmemBankMode { kNone, kSplit, kInterleave };
+  void SetDmemBanks(DmemBankMode mode, uint64_t param) {
+    dmem_bank_mode_ = mode;
+    dmem_bank_param_ = param;
+  }
+  // Called by the VLIW bundle semantic function around its children.
+  void BeginBundle() {
+    in_bundle_ = true;
+    bundle_addresses_.clear();
+  }
+  void EndBundle();
+  // Returns, and resets, the bank statistics accumulated since the last call:
+  // bundles with two or more memory ops, bundles with a bank conflict, and
+  // stall cycles charged for those conflicts.
+  void TakeBankStats(uint64_t& multi_mem_bundles, uint64_t& conflicts,
+                     uint64_t& stall_cycles) {
+    multi_mem_bundles = pending_multi_mem_bundles_;
+    conflicts = pending_bank_conflicts_;
+    stall_cycles = pending_bank_stall_cycles_;
+    pending_multi_mem_bundles_ = pending_bank_conflicts_ =
+        pending_bank_stall_cycles_ = 0;
+  }
+  bool has_pending_bank_stats() const { return pending_multi_mem_bundles_; }
+  // Optional log of the first two data addresses of every multi-memory
+  // bundle, used to choose a bank-aware data placement.
+  void EnableBankPairLog() { bank_pair_log_enabled_ = true; }
+  absl::Status WriteBankPairLog(const std::string& path) const;
+
   // Called by the fence instruction semantic function to signal a fence
   // operation.
   void Fence(const Instruction* inst, int fm, int predecessor, int successor);
@@ -380,6 +416,16 @@ class RiscVState : public ArchState {
 
  private:
   InterruptCode PickInterrupt(uint32_t interrupts);
+  // Banked data-memory model state (see SetDmemBanks).
+  DmemBankMode dmem_bank_mode_ = DmemBankMode::kNone;
+  uint64_t dmem_bank_param_ = 0;
+  bool in_bundle_ = false;
+  std::vector<uint64_t> bundle_addresses_;
+  uint64_t pending_multi_mem_bundles_ = 0;
+  uint64_t pending_bank_conflicts_ = 0;
+  uint64_t pending_bank_stall_cycles_ = 0;
+  bool bank_pair_log_enabled_ = false;
+  std::map<std::pair<uint64_t, uint64_t>, uint64_t> bank_pair_log_;
   RiscVXlen xlen_;
   uint64_t max_physical_address_;
   RiscVVectorState* rv_vector_ = nullptr;

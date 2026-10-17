@@ -145,6 +145,12 @@ class RiscVTop : public generic::Component, public RiscVDebugInterface {
     return &counter_num_cycles_;
   }
   generic::SimpleCounter<uint64_t>* counter_pc() { return &counter_pc_; }
+
+  // Per-address execution counts (enable before Run()). In the VLIW
+  // simulator a bundle is counted once, at the address of its hint.
+  void EnablePcHistogram() { pc_histogram_enabled_ = true; }
+  // Writes "0x<address> <count>" lines, sorted by address.
+  absl::Status WritePcHistogram(const std::string& path) const;
   // Memory watchers used for data watch points.
   util::MemoryWatcher* memory_watcher() { return memory_watcher_; }
 
@@ -219,6 +225,12 @@ class RiscVTop : public generic::Component, public RiscVDebugInterface {
   // the pc to be written to the counter, and the profiling can be enabled/
   // disabled with the other counters.
   generic::SimpleCounter<uint64_t> counter_pc_;
+  // STARBUG banked data-memory statistics (see RiscVState::SetDmemBanks).
+  generic::SimpleCounter<uint64_t> counter_multi_mem_bundles_;
+  generic::SimpleCounter<uint64_t> counter_bank_conflicts_;
+  generic::SimpleCounter<uint64_t> counter_bank_stall_cycles_;
+  bool pc_histogram_enabled_ = false;
+  absl::flat_hash_map<uint64_t, uint64_t> pc_histogram_;
   absl::flat_hash_map<uint32_t, std::string> register_id_map_;
   // Configuration items.
   Config<std::string> icache_config_;
