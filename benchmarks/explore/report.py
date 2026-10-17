@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Summarise run_explore.sh output.
+
+Writes OUT/results.md (all benchmarks) and OUT/<bench>/hot_blocks.md (the
+hottest basic blocks, their assembly, and how each rule set bundles them).
+
+Block execution counts come from the scalar build's --pc_histogram run; every
+variant has the same control flow, so the same counts apply to all of them.
+A self-check predicts each variant's whole-program slot count as
+  scalar instructions - sum over blocks(count * (instructions - slots))
+and compares it with the simulator's num_cycles for that variant.
+"""
+
+import glob
+import json
+import os
+import re
+import sys
+
+RULES = ["R0", "R1", "R2", "R3", "R2b", "R3b"]
+BANKS = ["none", "split_0x80000000", "interleave_2", "interleave_6"]
+BANK_LABEL = {"none": "ideal (no conflicts)", "split_0x80000000": "upper/lower halves",
+              "interleave_2": "interleave, 4 B (word)", "interleave_6": "interleave, 64 B (line)"}
+TOP_BLOCKS = 5
+BIG_BLOCK = 40      # blocks longer than this are summarised, not listed
+REASON_CATS = [("RAW", "waits for a result (RAW)"), ("WAR", "waits: would overwrite a register still being read (WAR)"),
+               ("WAW", "waits: same destination register (WAW)"), ("memory order", "memory order behind a store"),
+               ("lane 0", "lane 0 / memory port busy"), ("load ports", "both load ports busy"),
+               ("4 instructions", "bundle full (4)"), ("never bundled", "branch: never bundled"),
+               ("ready at block start", "issued in the first bundle"), ("", "other")]
+
+
+def reason_cat(r):
+  for key, label in REASON_CATS:
+    if key in r:
+      return label
+  return "other"
+
+
+def reason_table(D, name):
+  rows = []
+  for r in RULES:
+    sb = D["sched"][r][name]
+    cnt = {}
+    for k, bnd in enumerate(sb["bundles"]):
+      for i in bnd:
+        if k == 0:
+          continue
+        c = reason_cat(sb["reasons"][i])
+        cnt[c] = cnt.get(c, 0) + 1
+    rows.append((r, cnt))
+  cats = [lab for _k, lab in REASON_CATS if any(lab in c for _r, c in rows)]
+  L = ["Why instructions could not issue in an earlier bundle (instruction counts):\n",
+       "| rule | " + " | ".join(cats) + " |", "|---|" + "---|" * len(cats)]
+  for r, c in rows:
+    L.append("| %s | %s |" % (r, " | ".join(str(c.get(x, 0)) for x in cats)))
+  return L
+
+
+def kv(path):
+  try:
+    txt = open(path).read()
+  except OSError:
+    return {}
+  return dict(re.findall(r"^(\w+)=(\S+)", txt, re.M))
+
+
+def proto(path):
+  vals, name = {}, None
+  try:
+    for line in open(path):
+      m = re.search(r'name: "(\w+)"', line)
+      if m:
+        name = m.group(1)
+        continue
+      m = re.search(r"uint64_value: (\d+)", line)
+      if m and name:
+        vals[name] = int(m.group(1))
+        name = None
+  except OSError:
+    pass
+  return vals
+
+
+def run(d, tag):
+  r = kv(os.path.join(d, "runs", tag, "stdout.txt"))
+  p = glob.glob(os.path.join(d, "runs", tag, "*.proto"))
+  r["proto"] = proto(p[0]) if p else {}
+  return r
+
+
+def sched(d):
+  blocks = {}
+  for f in sorted(glob.glob(os.path.join(d, "*.sched.json"))):
+    for blk in json.load(open(f))["blocks"]:
+      blocks[blk["label"]] = blk
+  return blocks
+
+
+def bench_data(out, b):
+  d = os.path.join(out, b)
+  hist = {}
+  for line in open(os.path.join(d, "scalar", "pc_histogram.txt")):
+    a, c = line.split()
+    hist[int(a, 16)] = int(c)
+  labels = {}
+  for line in open(os.path.join(d, "scalar", "block_labels.txt")):
+    a, _t, name = line.split()
+    labels[name] = int(a, 16)
+  data = {"bench": b, "dir": d, "hist": hist, "labels": labels,
+          "scalar": run(os.path.join(d, "scalar"), "g"),
+          "sched": {r: sched(os.path.join(d, r)) for r in ["scalar"] + RULES}}
+  for r in RULES:
+    rd = os.path.join(d, r)
+    data[r] = {"g": run(rd, "g"),
+               "vliw": {bk: run(rd, "vliw_" + bk) for bk in BANKS
+                        if os.path.isdir(os.path.join(rd, "runs", "vliw_" + bk))},
+               "rule_check": open(os.path.join(rd, "rule_check.txt")).read().strip()}
+    rc = os.path.join(rd, "rtl_check.txt")
+    if os.path.exists(rc):
+      m = re.search(r"UNSAFE bundles\s*:\s*(\d+)", open(rc).read())
+      data[r]["rtl_unsafe"] = int(m.group(1)) if m else None
+  # block execution counts
+  counts = {}
+  for name, blk in data["sched"]["scalar"].items():
+    counts[name] = data["hist"].get(labels.get(name, -1), 0)
+  data["counts"] = counts
+  return data
+
+
+def predicted_cycles(data, r):
+  total = data["scalar"]["proto"].get("num_instructions", 0)
+  for name, blk in data["sched"][r].items():
+    total -= data["counts"].get(name, 0) * (len(blk["insns"]) - len(blk["bundles"]))
+  return total
+
+
+def fmt_x(a, b):
+  return "%.2fx" % (a / b) if a and b else "n/a"
+
+
+def results_md(all_data):
+  L = []
+  L.append("# STARBUG rule-set experiment: second load port and branches in bundles\n")
+  L.append("Generated by `benchmarks/explore/run_explore.sh` (see `starbug_bundle.py` for the "
+           "exact rules). Slots are MPACT issue slots for the timed `benchmark()` region "
+           "(`mcycle`); a bundle costs 1 slot, plus 1 per bank-conflict stall where modelled.\n")
+  L.append("## 1. Issue slots per rule set (ideal memory, no bank conflicts)\n")
+  L.append("| benchmark | scalar -O2 | R0 current | R1 +load | R2 +branch (lane 0) | "
+           "R2b +branch (own lane) | R3 = R1+R2 | R3b = R1+R2b | correct | rule checks |")
+  L.append("|---|---|---|---|---|---|---|---|---|---|")
+  for D in all_data:
+    s = int(D["scalar"].get("kernel_cycles", 0))
+    k = {r: int(D[r]["vliw"].get("none", {}).get("kernel_cycles", 0)) for r in RULES}
+    ok = all(D[r]["vliw"][bk].get("verify") == "PASS" for r in RULES for bk in D[r]["vliw"]) \
+        and D["scalar"].get("verify") == "PASS" and all(D[r]["g"].get("verify") == "PASS" for r in RULES)
+    checks = all(" 0 break" in D[r]["rule_check"] for r in RULES) and D["R0"].get("rtl_unsafe") == 0
+    def cell(r):
+      return "%d (%s, %+.1f%%)" % (k[r], fmt_x(s, k[r]), 100.0 * (k["R0"] - k[r]) / k["R0"] if k["R0"] else 0)
+    L.append("| %s | %d | %d (%s) | %s | %s | %s | %s | %s | %s | %s |" % (
+        D["bench"], s, k["R0"], fmt_x(s, k["R0"]),
+        cell("R1"), cell("R2"), cell("R2b"), cell("R3"), cell("R3b"),
+        "all PASS" if ok else "**FAIL**", "all pass" if checks else "**see logs**"))
+  L.append("\nEach cell: kernel slots (speedup over scalar, slots removed relative to R0).\n")
+
+  L.append("## 2. Second load port on a two-bank data memory\n")
+  L.append("Kernel slots when a same-bank pair costs one stall. *pairs* = bundles that issued two "
+           "loads; *conflict* = share of those pairs that hit the same bank (whole program).\n")
+  for r in ("R1", "R3", "R3b"):
+    L.append("### %s\n" % {"R1": "R1 (+load)", "R3": "R3 (+load, +branch on lane 0)",
+                           "R3b": "R3b (+load, +branch on its own lane)"}[r])
+    L.append("| benchmark | R0 | " + " | ".join(BANK_LABEL[b] for b in BANKS) +
+             " | upper/lower + bank-aware placement |")
+    L.append("|---|---|" + "---|" * (len(BANKS) + 1))
+    for D in all_data:
+      r0 = int(D["R0"]["vliw"]["none"].get("kernel_cycles", 0))
+      cells = []
+      for bk in BANKS:
+        v = D[r]["vliw"].get(bk, {})
+        kc = int(v.get("kernel_cycles", 0))
+        p = v.get("proto", {})
+        pairs, conf = p.get("num_multi_mem_bundles", 0), p.get("num_bank_conflicts", 0)
+        if bk == "none":
+          cells.append("%d (%+.1f%%), %d pairs" % (kc, 100.0 * (r0 - kc) / r0 if r0 else 0, pairs))
+        else:
+          cells.append("%d (%+.1f%%), %.0f%% conflict" % (
+              kc, 100.0 * (r0 - kc) / r0 if r0 else 0, 100.0 * conf / pairs if pairs else 0))
+      pl = run(os.path.join(D["dir"], "place", r), "vliw_split_placed")
+      kc, p = int(pl.get("kernel_cycles", 0) or 0), pl.get("proto", {})
+      pairs, conf = p.get("num_multi_mem_bundles", 0), p.get("num_bank_conflicts", 0)
+      ok = pl.get("verify") == "PASS" and " 0 break" in open(os.path.join(
+          D["dir"], "place", r, "rule_check.txt")).read()
+      cells.append("%d (%+.1f%%), %.0f%% conflict%s" % (
+          kc, 100.0 * (r0 - kc) / r0 if r0 else 0, 100.0 * conf / pairs if pairs else 0,
+          "" if ok else " **CHECK FAILED**") if kc else "n/a")
+      L.append("| %s | %d | %s |" % (D["bench"], r0, " | ".join(cells)))
+    L.append("")
+  L.append("Percentages in each cell are slots removed relative to R0.\n")
+  L.append("### Bank-aware placement (R3b profile)\n")
+  L.append("`place_banks.py` output: how many logged load pairs fell inside a single object "
+           "(no placement can separate them) and which objects were moved to the stack's half.\n")
+  for D in all_data:
+    f = os.path.join(D["dir"], "place", "R3b", "placement.txt")
+    if os.path.exists(f):
+      L.append("**%s**\n```\n%s\n```" % (D["bench"], open(f).read().strip()))
+  L.append("")
+
+  L.append("## 3. Self-check: bundler accounting vs simulator\n")
+  L.append("Predicted whole-program slots (block counts x slots per block) against the "
+           "simulator's `num_cycles` with ideal memory. Any difference means the bundler's "
+           "view and the binary disagree. A positive difference can come from the "
+           "assembler rewriting an out-of-range conditional branch as branch + jump: the "
+           "hints make the code larger, so a few more branches go out of range (seen in "
+           "nsichneu, which has 343 such branches even in the scalar build). "
+           "`rule_check.py` confirms none of them sits inside a bundle.\n")
+  L.append("| benchmark | " + " | ".join("%s predicted / measured" % r for r in RULES) + " |")
+  L.append("|---|" + "---|" * len(RULES))
+  for D in all_data:
+    cells = []
+    for r in RULES:
+      pred = predicted_cycles(D, r)
+      meas = D[r]["vliw"]["none"]["proto"].get("num_cycles", 0)
+      cells.append("%d / %d%s" % (pred, meas, "" if pred == meas else " **(%+d)**" % (meas - pred)))
+    L.append("| %s | %s |" % (D["bench"], " | ".join(cells)))
+  return "\n".join(L) + "\n"
+
+
+def hot_md(D):
+  b = D["bench"]
+  total = D["scalar"]["proto"].get("num_instructions", 1)
+  blocks = D["sched"]["scalar"]
+  ranked = sorted(blocks, key=lambda n: -D["counts"].get(n, 0) * len(blocks[n]["insns"]))
+  L = ["# %s: hottest basic blocks\n" % b]
+  s = int(D["scalar"].get("kernel_cycles", 0))
+  L.append("Scalar kernel: %d slots. %s (ideal memory).\n" % (
+      s, ", ".join("%s %s" % (r, D[r]["vliw"]["none"].get("kernel_cycles")) for r in RULES)))
+  L.append("Each block is labelled `Lsb_<file>_<n>` in every build. To see it in context, "
+           "search for that label in `<rule>/%s.dis` (disassembly) or `<rule>/<file>.s` "
+           "(bundled assembly) under `%s/`.\n" % (b, D["dir"]))
+  covered = 0
+  for name in ranked[:TOP_BLOCKS]:
+    blk = blocks[name]
+    n = len(blk["insns"])
+    c = D["counts"].get(name, 0)
+    if not c:
+      break
+    covered += c * n
+    L.append("## `%s` in `%s()`, executed %d times, %.1f%% of all instructions\n" % (
+        name, blk["function"], c, 100.0 * c * n / total))
+    addr = D["labels"].get(name)
+    L.append("Scalar address 0x%x. Slots per execution: scalar %d, %s.\n" % (
+        addr or 0, n, ", ".join("%s %d" % (r, len(D["sched"][r][name]["bundles"])) for r in RULES)))
+    mix = {}
+    for cl in blk["classes"]:
+      mix[cl] = mix.get(cl, 0) + 1
+    L.append("Instruction mix: %s.\n" % ", ".join("%d %s" % (v, k) for k, v in sorted(mix.items(), key=lambda x: -x[1])))
+    if n > BIG_BLOCK:
+      L.append("Block has %d instructions (fully unrolled code); the first 24 are shown, and the "
+               "per-rule schedules are summarised below. See the label in the `.s`/`.dis` files "
+               "for the full listing.\n" % n)
+    L.append("```")
+    for i, (t, cl) in enumerate(zip(blk["insns"], blk["classes"])):
+      if n > BIG_BLOCK and i >= 24:
+        L.append("    ... %d more" % (n - 24))
+        break
+      L.append("%2d  %-34s %s" % (i, t, cl))
+    L.append("```\n")
+    L += reason_table(D, name)
+    L.append("")
+    if n > BIG_BLOCK:
+      continue
+    for r in RULES:
+      sb = D["sched"][r][name]
+      L.append("**%s** (%d slots):\n" % (r, len(sb["bundles"])))
+      L.append("```")
+      for k, bnd in enumerate(sb["bundles"]):
+        L.append("b%-2d %s%s" % (k, "c.li x0,%d  " % len(bnd) if len(bnd) > 1 else "            ",
+                                 "  |  ".join(sb["insns"][i] for i in bnd)))
+      L.append("```")
+      L.append("<details><summary>why each instruction landed where it did</summary>\n")
+      for k, bnd in enumerate(sb["bundles"]):
+        for i in bnd:
+          L.append("- b%d `%s`: %s" % (k, sb["insns"][i], sb["reasons"][i]))
+      L.append("\n</details>\n")
+  L.append("Top %d blocks cover %.1f%% of all executed instructions.\n" % (
+      TOP_BLOCKS, 100.0 * covered / total))
+  # Flat profiles (many small blocks): group blocks by their instruction shape.
+  shapes = {}
+  for name, blk in blocks.items():
+    c = D["counts"].get(name, 0)
+    if not c:
+      continue
+    key = tuple(t.split()[0] for t in blk["insns"])
+    e = shapes.setdefault(key, {"dyn": 0, "blocks": 0, "example": name,
+                                "slots": {r: 0 for r in ["scalar"] + RULES}})
+    e["dyn"] += c * len(blk["insns"])
+    e["blocks"] += 1
+    for r in ["scalar"] + RULES:
+      e["slots"][r] += c * len(D["sched"][r][name]["bundles"])
+  L.append("## Most common block shapes (all blocks with the same instruction sequence, grouped)\n")
+  L.append("| shape (mnemonics) | blocks | % of instructions | scalar | " + " | ".join(RULES) + " | example |")
+  L.append("|---|---|---|---|" + "---|" * len(RULES) + "---|")
+  for key, e in sorted(shapes.items(), key=lambda kv: -kv[1]["dyn"])[:8]:
+    sh = " ".join(key) if len(key) <= 12 else " ".join(key[:12]) + " ... (%d)" % len(key)
+    L.append("| `%s` | %d | %.1f%% | %s | `%s` |" % (
+        sh, e["blocks"], 100.0 * e["dyn"] / total,
+        " | ".join(str(e["slots"][r]) for r in ["scalar"] + RULES), e["example"]))
+  L.append("\nSlot columns are dynamic slots summed over every block of that shape.\n")
+  return "\n".join(L)
+
+
+def main():
+  out = sys.argv[1]
+  benches = sys.argv[2:]
+  all_data = []
+  for b in benches:
+    try:
+      D = bench_data(out, b)
+    except OSError as e:
+      print("%s: missing data (%s)" % (b, e), file=sys.stderr)
+      continue
+    all_data.append(D)
+    open(os.path.join(out, b, "hot_blocks.md"), "w").write(hot_md(D))
+  open(os.path.join(out, "results.md"), "w").write(results_md(all_data))
+  print(open(os.path.join(out, "results.md")).read())
+
+
+if __name__ == "__main__":
+  main()
