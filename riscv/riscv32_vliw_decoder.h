@@ -33,6 +33,15 @@ namespace mpact {
 namespace sim {
 namespace riscv {
 
+// Executed custom-0 packets, indexed by the number of operations in the
+// packet. width[0] is unused. Counted when the packet runs, not when it is
+// decoded, so a cached packet still counts once per execution.
+struct StarbugPacketHistogram {
+  uint64_t width[5] = {};
+};
+
+StarbugPacketHistogram StarbugExecutedPacketHistogram();
+
 using ::mpact::sim::generic::operator*;  // NOLINT: clang-tidy false positive.
 
 // This is the factory class needed by the generated decoder. It is responsible
@@ -72,6 +81,9 @@ class RiscV32Decoder : public generic::DecoderInterface {
   isa32::RiscV32GEncoding* riscv_encoding() const { return riscv_encoding_; }
 
  private:
+  generic::Instruction* DecodeInstructionAt(uint64_t address, bool allow_packet);
+  generic::Instruction* DecodeExecutePacket(uint64_t address, uint32_t iword);
+
   RiscVState* state_;
   util::MemoryInterface* memory_;
   std::unique_ptr<generic::ProgramError> decode_error_;

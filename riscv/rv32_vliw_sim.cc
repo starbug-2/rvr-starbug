@@ -501,11 +501,18 @@ int main(int argc, char** argv) {
     if (!quiet) {
       std::cerr << absl::StrFormat("Simulation done: %0.1f sec\n", sec)
                 << std::endl;
-      absl::StatusOr<uint64_t> cycles = riscv_top.ReadRegister("mcycle");
-      if (cycles.ok()) {
-        std::cerr << "Cycle count = " << *cycles << "\n";
-      }      
     }
+    // Always print mcycle. --quiet only suppresses the per-instruction
+    // decoder log; the cycle line is the measurement output.
+    absl::StatusOr<uint64_t> cycles = riscv_top.ReadRegister("mcycle");
+    if (cycles.ok()) {
+      std::cerr << "Cycle count = " << *cycles << "\n";
+    }
+    const mpact::sim::riscv::StarbugPacketHistogram packets =
+        mpact::sim::riscv::StarbugExecutedPacketHistogram();
+    std::cerr << "Packet width histogram = 1:" << packets.width[1]
+              << ";2:" << packets.width[2] << ";3:" << packets.width[3]
+              << ";4:" << packets.width[4] << "\n";
   }
 
   // Export counters.
