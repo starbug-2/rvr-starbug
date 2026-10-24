@@ -76,6 +76,9 @@ I_TYPE = {"addi", "slti", "sltiu", "xori", "ori", "andi", "slli", "srli", "srai"
 PSEUDO_RR = {"mv", "not", "neg", "seqz", "snez", "sltz", "sgtz"}
 LOADS = {"lb", "lbu", "lh", "lhu", "lw"}
 STORES = {"sb", "sh", "sw"}
+# STARBUG2 post-increment forms (custom-1): access at rs1, then rs1 += imm.
+PI_FUNCT3 = {"lb.pi": 0, "lh.pi": 1, "lw.pi": 2, "lbu.pi": 4, "lhu.pi": 5,
+             "sw.pi": 3, "sb.pi": 6, "sh.pi": 7}
 BR2 = {"beq", "bne", "blt", "bge", "bltu", "bgeu", "bgt", "ble", "bgtu", "bleu"}
 BR1 = {"beqz", "bnez", "blez", "bgez", "bltz", "bgtz"}
 MEM_RE = re.compile(r"^(.*)\(\s*([A-Za-z0-9]+)\s*\)$")
@@ -90,6 +93,8 @@ class Insn:
     self.defs = set()
     self.uses = set()
     self.why_barrier = ""
+    self.emit = self.text    # what is written to the output assembly
+    self.pred = None         # STARBUG2 predicate: (register, z) or None
 
   @property
   def is_mem(self):
@@ -130,6 +135,15 @@ def classify(text):
         ins.why_barrier = "li expands to 2 instructions"
     elif mnem == "nop":
       ins.cls = "alu"
+    elif mnem in PI_FUNCT3:
+      m = MEM_RE.match(ops[1])
+      base, imm = reg(m.group(2)), int(m.group(1), 0)
+      if mnem.startswith("l"):
+        ins.cls, ins.defs, ins.uses = "load", {reg(ops[0]), base}, {base}
+        ins.emit = ".insn i 0x2b, %d, %s, %s, %d" % (PI_FUNCT3[mnem], ops[0], m.group(2), imm)
+      else:
+        ins.cls, ins.defs, ins.uses = "store", {base}, {reg(ops[0]), base}
+        ins.emit = ".insn s 0x2b, %d, %s, %d(%s)" % (PI_FUNCT3[mnem], ops[0], imm, m.group(2))
     elif mnem in LOADS:
       m = MEM_RE.match(ops[1])
       ins.cls, ins.defs, ins.uses = "load", {reg(ops[0])}, {reg(m.group(2))}
@@ -308,9 +322,24 @@ DIRECTIVE_OK = re.compile(r"^\s*\.(cfi_|loc\b)")
 TEXT_SECTION = re.compile(r"^\s*\.(text\b|section\s+\.text)")
 OTHER_SECTION = re.compile(r"^\s*\.(section|data\b|bss\b|rodata\b)")
 LABEL = re.compile(r"^([A-Za-z_.$][\w.$]*):")
+PRED_MARK = re.compile(r"#@pred\s+(\w+)\s+([01])")   # set by starbug2_transform
 
 
-def process(lines, rules, file_id):
+def hint_header(insns, bnd):
+  """Bundle marker for the STARBUG1 hint encoding."""
+  return ["\tc.li\tx0,%d\n" % len(bnd)]
+
+
+def process(lines, rules, file_id, schedule_fn=None, header_fn=hint_header):
+  """Re-emit an assembly file with every basic block bundled.
+
+  schedule_fn(insns) -> (bundles, reasons) defaults to this file's R0-R3b
+  scheduler; header_fn(insns, bundle) returns the marker lines placed before
+  each multi-instruction bundle (see starbug2_bundle.py for the custom-0
+  header).
+  """
+  if schedule_fn is None:
+    schedule_fn = lambda insns: schedule(insns, rules)
   out = ["\t.option norelax\t# bundles hold an exact instruction count\n"]
   blocks_json = []
   in_text = False
@@ -328,18 +357,21 @@ def process(lines, rules, file_id):
       bundles = [[i] for i in range(len(insns))]
       reasons = {i: (insns[i].why_barrier or "scalar build") for i in range(len(insns))}
     else:
-      bundles, reasons = schedule(insns, rules)
+      bundles, reasons = schedule_fn(insns)
     for bnd in bundles:
-      if len(bnd) > 1:
-        out.append("\tc.li\tx0,%d\n" % len(bnd))
+      if len(bnd) > 1 or insns[bnd[0]].pred:
+        out.extend(header_fn(insns, bnd))
       for i in bnd:
-        out.append("\t%s\n" % insns[i].text)
+        out.append("\t%s\n" % insns[i].emit)
     blocks_json.append({
         "label": label, "function": func, "insns": [x.text for x in insns],
         "classes": [x.cls for x in insns], "bundles": bundles,
+        "preds": [("%s%s" % ("!" if x.pred[1] else "", x.pred[0])) if x.pred else ""
+                  for x in insns],
+        "lines": [getattr(x, "line", None) for x in insns],
         "reasons": [reasons[i] for i in range(len(insns))]})
 
-  for line in lines:
+  for line_no, line in enumerate(lines):
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
       out.append(line)
@@ -371,6 +403,11 @@ def process(lines, rules, file_id):
       out.append(line)
       continue
     ins = classify(stripped.split("#")[0])
+    ins.line = line_no
+    pm = PRED_MARK.search(stripped)
+    if pm:
+      ins.pred = (pm.group(1), int(pm.group(2)))
+      ins.uses.add(reg(pm.group(1)))
     if ins.cls == "barrier":
       emit_block(block); block = []
       emit_block([ins])
@@ -382,6 +419,55 @@ def process(lines, rules, file_id):
   return out, blocks_json
 
 
+UNCONDITIONAL = ("j", "jr", "ret", "tail")
+LOOP_LABEL = re.compile(r"^(\.L\w+):")
+
+
+def code_bytes(line):
+  """Upper bound on the bytes a line assembles to (4 per instruction/word)."""
+  t = line.split("#")[0].split()
+  if not t or t[0].endswith(":"):
+    return 0
+  if t[0] == ".word":
+    return 4
+  return 0 if t[0].startswith(".") else 4
+
+
+def align_loops(lines, line_bytes):
+  """Fetch-aware layout: start each small loop (a label that a later branch
+  jumps back to, with a body that fits in one I-cache line even if nothing
+  is compressed) on a line boundary, so none of its packets crosses a line.
+  Larger loops are left alone: aligning them only moves the crossings. The
+  padding is jumped over: if the code before the loop can fall into it, a
+  `j` to the loop is inserted, costing one cycle per loop entry instead of
+  executing the padding."""
+  label_at, backward = {}, set()
+  for idx, line in enumerate(lines):
+    m = LOOP_LABEL.match(line)
+    if m:
+      label_at[m.group(1)] = idx
+      continue
+    t = line.split("#")[0].split()
+    if t and not t[0].startswith(".") and not t[0].endswith(":"):
+      target = t[-1].split(",")[-1]
+      if target in label_at and label_at[target] < idx:
+        body = sum(code_bytes(l) for l in lines[label_at[target]:idx + 1])
+        if body <= line_bytes:
+          backward.add(target)
+  out, last_insn = [], None
+  for line in lines:
+    m = LOOP_LABEL.match(line)
+    if m and m.group(1) in backward:
+      if last_insn not in UNCONDITIONAL:
+        out.append("\tj\t%s\t\t# jump over the alignment padding\n" % m.group(1))
+      out.append("\t.balign\t%d\n" % line_bytes)
+    out.append(line)
+    t = line.split("#")[0].split()
+    if t and not t[0].startswith(".") and not t[0].endswith(":"):
+      last_insn = t[0]
+  return out
+
+
 def main():
   ap = argparse.ArgumentParser(description=__doc__,
                                formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -389,8 +475,12 @@ def main():
   ap.add_argument("output")
   ap.add_argument("--rules", required=True, choices=["scalar", "R0", "R1", "R2", "R3", "R2b", "R3b"])
   ap.add_argument("--file-id", type=int, default=0)
+  ap.add_argument("--align-loops", type=int, default=0, metavar="BYTES",
+                  help="start small loops on BYTES-aligned lines (0 = off)")
   args = ap.parse_args()
   out, blocks = process(open(args.input).readlines(), Rules(args.rules), args.file_id)
+  if args.align_loops:
+    out = align_loops(out, args.align_loops)
   open(args.output, "w").writelines(out)
   json.dump({"rules": args.rules, "file_id": args.file_id, "blocks": blocks},
             open(args.output.rsplit(".", 1)[0] + ".sched.json", "w"), indent=1)

@@ -283,7 +283,37 @@ class RiscVState : public ArchState {
     pending_multi_mem_bundles_ = pending_bank_conflicts_ =
         pending_bank_stall_cycles_ = 0;
   }
-  bool has_pending_bank_stats() const { return pending_multi_mem_bundles_; }
+  bool has_pending_bank_stats() const {
+    return pending_multi_mem_bundles_ || pending_line_crossings_;
+  }
+  // STARBUG2 fetch model: an execute packet that spans two I-cache lines of
+  // this many bytes costs one extra cycle (0 disables the model).
+  void SetPacketLineBytes(uint64_t bytes) { packet_line_bytes_ = bytes; }
+  // STARBUG2 predicate registers selected by creg 1..N (default x9-x15).
+  void SetStarbugPredRegs(std::vector<std::string> regs) { starbug_pred_regs_ = std::move(regs); }
+  const std::vector<std::string>& starbug_pred_regs() const { return starbug_pred_regs_; }
+  void ChargePacketFetch(uint64_t address, uint64_t size) {
+    if (CrossesLine(address, size)) {
+      pending_line_crossings_++;
+      pending_fetch_cycles_ += 1;
+    }
+  }
+  // STARBUG1 (c.li hint) bundles use the same line size: the RTL fetch unit
+  // declines a bundle that spans two lines and runs the hint as a NOP and
+  // the members one per cycle, so N members cost N extra cycles.
+  void ChargeHintFetch(uint64_t address, uint64_t size, uint64_t members) {
+    if (CrossesLine(address, size)) {
+      pending_line_crossings_++;
+      pending_fetch_cycles_ += members;
+    }
+  }
+  // Returns, and resets, the line crossings and the cycles they cost since
+  // the last call.
+  void TakeLineCrossings(uint64_t& crossings, uint64_t& cycles) {
+    crossings = pending_line_crossings_;
+    cycles = pending_fetch_cycles_;
+    pending_line_crossings_ = pending_fetch_cycles_ = 0;
+  }
   // Optional log of the first two data addresses of every multi-memory
   // bundle, used to choose a bank-aware data placement.
   void EnableBankPairLog() { bank_pair_log_enabled_ = true; }
@@ -425,6 +455,14 @@ class RiscVState : public ArchState {
   uint64_t pending_bank_conflicts_ = 0;
   uint64_t pending_bank_stall_cycles_ = 0;
   bool bank_pair_log_enabled_ = false;
+  uint64_t packet_line_bytes_ = 0;
+  std::vector<std::string> starbug_pred_regs_ = {"x9", "x10", "x11", "x12", "x13", "x14", "x15"};
+  uint64_t pending_line_crossings_ = 0;
+  uint64_t pending_fetch_cycles_ = 0;
+  bool CrossesLine(uint64_t address, uint64_t size) const {
+    return packet_line_bytes_ != 0 && size != 0 &&
+           address / packet_line_bytes_ != (address + size - 1) / packet_line_bytes_;
+  }
   std::map<std::pair<uint64_t, uint64_t>, uint64_t> bank_pair_log_;
   RiscVXlen xlen_;
   uint64_t max_physical_address_;

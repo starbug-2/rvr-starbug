@@ -14,6 +14,7 @@
 
 #include "riscv/riscv_i_instructions.h"
 
+#include <any>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -339,12 +340,75 @@ void RiscVExVLIW(const Instruction* instruction) {
   // Bracket the children so the state can check the bundle's data accesses
   // against the banked-memory model.
   auto* state = static_cast<RiscVState*>(instruction->state());
+  uint64_t members = 0;
+  for (Instruction* c = instruction->child(); c != nullptr; c = c->next()) members++;
+  state->ChargeHintFetch(instruction->address(), instruction->size(), members);
   state->BeginBundle();
   Instruction* child = instruction->child();
   while (child != nullptr) {
     // LOG(INFO) << " -> executing child opcode: " << child->opcode();
     child->Execute();
     child = child->next();
+  }
+  state->EndBundle();
+}
+
+// STARBUG2 post-increment: write the updated base straight into rs1's
+// register, as the load child writes rd.
+static void StarbugPostIncrement(const Instruction* instruction, uint32_t value) {
+  auto* reg = std::any_cast<generic::RegisterBase*>(instruction->Source(0)->GetObject());
+  reg->data_buffer()->Set<uint32_t>(0, value);
+}
+
+template <typename ValueType>
+static void StarbugLoadPostInc(const Instruction* instruction) {
+  uint32_t base = generic::GetInstructionSource<uint32_t>(instruction, 0);
+  int32_t inc = generic::GetInstructionSource<int32_t>(instruction, 1);
+  auto* value_db = instruction->state()->db_factory()->Allocate(sizeof(ValueType));
+  value_db->set_latency(0);
+  auto* context = new LoadContext(value_db);
+  auto* state = static_cast<RiscVState*>(instruction->state());
+  state->LoadMemory(instruction, base, value_db, instruction->child(), context);
+  context->DecRef();
+  StarbugPostIncrement(instruction, base + inc);
+}
+
+template <typename ValueType>
+static void StarbugStorePostInc(const Instruction* instruction) {
+  uint32_t base = generic::GetInstructionSource<uint32_t>(instruction, 0);
+  int32_t inc = generic::GetInstructionSource<int32_t>(instruction, 1);
+  ValueType value = generic::GetInstructionSource<ValueType>(instruction, 2);
+  auto* state = static_cast<RiscVState*>(instruction->state());
+  auto* db = state->db_factory()->Allocate(sizeof(ValueType));
+  db->Set<ValueType>(0, value);
+  state->StoreMemory(instruction, base, db);
+  db->DecRef();
+  StarbugPostIncrement(instruction, base + inc);
+}
+
+void RiscVStarbugLbPi(const Instruction* i) { StarbugLoadPostInc<int8_t>(i); }
+void RiscVStarbugLhPi(const Instruction* i) { StarbugLoadPostInc<int16_t>(i); }
+void RiscVStarbugLwPi(const Instruction* i) { StarbugLoadPostInc<int32_t>(i); }
+void RiscVStarbugLbuPi(const Instruction* i) { StarbugLoadPostInc<uint8_t>(i); }
+void RiscVStarbugLhuPi(const Instruction* i) { StarbugLoadPostInc<uint16_t>(i); }
+void RiscVStarbugSbPi(const Instruction* i) { StarbugStorePostInc<uint8_t>(i); }
+void RiscVStarbugShPi(const Instruction* i) { StarbugStorePostInc<uint16_t>(i); }
+void RiscVStarbugSwPi(const Instruction* i) { StarbugStorePostInc<uint32_t>(i); }
+
+void RiscVExStarbugPacket(const Instruction* instruction) {
+  auto* state = static_cast<RiscVState*>(instruction->state());
+  state->ChargePacketFetch(instruction->address(), instruction->size());
+  // Every operation reads its predicate at the start of the cycle, so all
+  // predicates are sampled before any child commits a write.
+  bool enabled[16];
+  int n = 0;
+  for (Instruction* c = instruction->child(); c != nullptr && n < 16; c = c->next()) {
+    enabled[n++] = c->Predicate() == nullptr || c->Predicate()->Value();
+  }
+  state->BeginBundle();
+  n = 0;
+  for (Instruction* c = instruction->child(); c != nullptr && n < 16; c = c->next()) {
+    if (enabled[n++]) c->Execute();
   }
   state->EndBundle();
 }
@@ -374,6 +438,9 @@ void RiscVExVLIW(const Instruction* instruction) {
   // Bracket the children so the state can check the bundle's data accesses
   // against the banked-memory model.
   auto* state = static_cast<RiscVState*>(instruction->state());
+  uint64_t members = 0;
+  for (Instruction* c = instruction->child(); c != nullptr; c = c->next()) members++;
+  state->ChargeHintFetch(instruction->address(), instruction->size(), members);
   state->BeginBundle();
   Instruction* child = instruction->child();
   while (child != nullptr) {

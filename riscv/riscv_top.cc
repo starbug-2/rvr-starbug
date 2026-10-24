@@ -94,6 +94,7 @@ RiscVTop::RiscVTop(std::string name, RiscVState* state,
       counter_multi_mem_bundles_("num_multi_mem_bundles", 0),
       counter_bank_conflicts_("num_bank_conflicts", 0),
       counter_bank_stall_cycles_("num_bank_stall_cycles", 0),
+      counter_packet_line_crossings_("num_packet_line_crossings", 0),
       icache_config_("icache", ""),
       dcache_config_("dcache", "") {
   CHECK_OK(AddConfig(&icache_config_));
@@ -142,6 +143,7 @@ void RiscVTop::Initialize() {
   CHECK_OK(AddCounter(&counter_multi_mem_bundles_));
   CHECK_OK(AddCounter(&counter_bank_conflicts_));
   CHECK_OK(AddCounter(&counter_bank_stall_cycles_));
+  CHECK_OK(AddCounter(&counter_packet_line_crossings_));
   // Register opcode counters.
   int num_opcodes = rv_decoder_->GetNumOpcodes();
   counter_opcode_.resize(num_opcodes);
@@ -425,6 +427,11 @@ absl::Status RiscVTop::Run() {
         counter_bank_conflicts_.Increment(conflicts);
         counter_bank_stall_cycles_.Increment(stalls);
         counter_num_cycles_.Increment(stalls);
+        // A packet spanning two I-cache lines waits one cycle for the second.
+        uint64_t crossings, fetch_cycles;
+        state_->TakeLineCrossings(crossings, fetch_cycles);
+        counter_packet_line_crossings_.Increment(crossings);
+        counter_num_cycles_.Increment(fetch_cycles);
       }
       if (pc_histogram_enabled_) pc_histogram_[pc]++;
       // Update counters.

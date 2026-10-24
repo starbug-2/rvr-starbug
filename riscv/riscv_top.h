@@ -229,6 +229,7 @@ class RiscVTop : public generic::Component, public RiscVDebugInterface {
   generic::SimpleCounter<uint64_t> counter_multi_mem_bundles_;
   generic::SimpleCounter<uint64_t> counter_bank_conflicts_;
   generic::SimpleCounter<uint64_t> counter_bank_stall_cycles_;
+  generic::SimpleCounter<uint64_t> counter_packet_line_crossings_;
   bool pc_histogram_enabled_ = false;
   absl::flat_hash_map<uint64_t, uint64_t> pc_histogram_;
   absl::flat_hash_map<uint32_t, std::string> register_id_map_;

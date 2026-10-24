@@ -34,6 +34,7 @@
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -162,6 +163,12 @@ ABSL_FLAG(std::string, pc_histogram, "",
 ABSL_FLAG(std::string, dmem_banks, "none",
           "Banked data memory model for bundles: none | split:<address> | "
           "interleave:<address bit>");
+ABSL_FLAG(uint64_t, packet_line_bytes, 0,
+          "Fetch model: a custom-0 execute packet spanning two I-cache "
+          "lines of this size costs one extra cycle; a c.li hint bundle "
+          "runs scalar, costing one extra cycle per member (0 = off)");
+ABSL_FLAG(std::string, starbug_pred_regs, "x9,x10,x11,x12,x13,x14,x15",
+          "STARBUG2 predicate registers selected by creg 1..N");
 ABSL_FLAG(std::string, bank_pair_log, "",
           "Write the address pairs of every two-memory-op bundle to this file");
 
@@ -327,6 +334,9 @@ int main(int argc, char** argv) {
     riscv_top.EnablePcHistogram();
   }
   if (!absl::GetFlag(FLAGS_bank_pair_log).empty()) rv_state.EnableBankPairLog();
+  rv_state.SetPacketLineBytes(absl::GetFlag(FLAGS_packet_line_bytes));
+  rv_state.SetStarbugPredRegs(
+      absl::StrSplit(absl::GetFlag(FLAGS_starbug_pred_regs), ',', absl::SkipEmpty()));
 
   if (!absl::GetFlag(FLAGS_icache).empty()) {
     ComponentValueEntry icache_value;

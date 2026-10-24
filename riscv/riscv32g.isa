@@ -201,6 +201,36 @@ slot riscv32i {
       resources: { next_pc, rs1, rs2 : },
       disasm: "sb", "%rs2, %S_imm12(%rs1)",
       semfunc: "&RV32::RiscVISb";
+    // STARBUG2 execute-packet header (custom-0 opcode). The VLIW decoder
+    // attaches the packet's operations as children.
+    starbug_hdr{},
+      disasm: "starbug.hdr",
+      semfunc: "&RV32::RiscVExStarbugPacket";
+    // STARBUG2 post-increment loads/stores (custom-1): rs1 += imm after the access.
+    lb_pi{(: rs1, I_imm12), (: : rd)},
+      disasm: "lb.pi", "%rd, %I_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugLbPi", "&RV32::RiscVILbChild";
+    lh_pi{(: rs1, I_imm12), (: : rd)},
+      disasm: "lh.pi", "%rd, %I_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugLhPi", "&RV32::RiscVILhChild";
+    lw_pi{(: rs1, I_imm12), (: : rd)},
+      disasm: "lw.pi", "%rd, %I_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugLwPi", "&RV32::RiscVILwChild";
+    lbu_pi{(: rs1, I_imm12), (: : rd)},
+      disasm: "lbu.pi", "%rd, %I_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugLbuPi", "&RV32::RiscVILbuChild";
+    lhu_pi{(: rs1, I_imm12), (: : rd)},
+      disasm: "lhu.pi", "%rd, %I_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugLhuPi", "&RV32::RiscVILhuChild";
+    sb_pi{: rs1, S_imm12, rs2 : },
+      disasm: "sb.pi", "%rs2, %S_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugSbPi";
+    sh_pi{: rs1, S_imm12, rs2 : },
+      disasm: "sh.pi", "%rs2, %S_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugShPi";
+    sw_pi{: rs1, S_imm12, rs2 : },
+      disasm: "sw.pi", "%rs2, %S_imm12(%rs1)",
+      semfunc: "&RV32::RiscVStarbugSwPi";
     fence{: pred, succ : },
       disasm: "fence",
       semfunc: "&RiscVIFence";

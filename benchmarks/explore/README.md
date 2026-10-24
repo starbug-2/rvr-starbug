@@ -75,3 +75,50 @@ the bottom and the stack at the top.
 - WAR inside a bundle is forbidden (the paper's contract). The RTL reads
   registers before writing them, so allowing it is a possible further gain;
   nettle-sha256 is the benchmark most limited by it.
+
+# STARBUG2: custom-0 execute-packet header
+
+`run_starbug2.sh` evaluates the custom-0 header design (32-bit header with
+per-op predicates, read-at-start/commit-at-end semantics, no scalar fallback)
+on 4-way and 8-way machines, about 6 minutes for six benchmarks. Output in
+`../../../build/starbug2/`: `results.md` and `<bench>/hot_blocks.md`.
+
+| | |
+|---|---|
+| `starbug2_bundle.py` | packs blocks into packets for `--width 4/8`, `--extra-load`, `--branch none/lane0/own`, `--mdu-lanes N`, and emits the custom-0 header (thermometer count for up to 4 ops, two-word binary form for 5-8); `--align-loops 64` starts small loops on a cache line |
+| `rule_check2.py` | decodes every header in the binary and checks its packet against the machine configuration |
+| `report2.py` | tables: speedup per width/feature, 4-way vs 8-way with the fetch crossing, banked memory, multiplier count, self-check |
+
+Simulator support (this fork): the header is a real instruction in
+`riscv/riscv32g.bin_fmt` / `riscv32g.isa` (`starbug_hdr`, custom-0); the VLIW
+decoder (`riscv32_vliw_decoder.cc`) attaches the members and their predicates
+(x9-x15, z bit); `RiscVExStarbugPacket` samples every predicate before any
+member runs. `--packet_line_bytes=64` charges one cycle for a packet that
+spans two 64-byte I-cache lines, and N cycles for a STARBUG1 hint bundle of N
+members (last year's RTL runs it scalar). On `rv32g_sim` the header is a
+no-op, so STARBUG2 binaries are only meaningful on `rv32_vliw_sim`.
+
+Configurations: `-O2` and `-O2 -funroll-loops`; widths 4, 8, and 8 with
+multipliers on 4 lanes; features base / +load / +branch (lane 0) / +branch
+(own lane) and the two combinations; each in naive and loop-aligned layout;
++load builds also with word-interleaved and upper/lower banks (+ placement).
+Baselines: scalar, and the STARBUG1 hint design R0 under the same fetch rule.
+
+## STARBUG2 phase 2: predication and post-increment
+
+`run_phase2.sh` (about 15 minutes) adds, on top of the phase-1 packing:
+
+- **post-increment** (`--autoinc`): `lw rd,0(rp)` ... `addi rp,rp,k` becomes
+  `lw.pi rd,k(rp)`, a custom-1 instruction (placeholder encoding: I-type
+  loads / S-type stores, funct3 = width, access at rs1 then rs1 += imm),
+  simulated in `riscv32g.bin_fmt`/`.isa` (`*_pi`);
+- **if-conversion** (`--ifconvert`, `starbug2_transform.py`): if-then,
+  if-then-else and short-circuit guard chains become predicated packets.
+  Setup A uses the specified x9-x15 where per-function liveness shows them
+  free; setup B remaps `creg` to s8-s11 (`--pred-regs`, simulator
+  `--starbug_pred_regs`) and compiles everything with `-ffixed-s8..s11`.
+  Conversions are profile-guided (`make_profile.py` turns a scalar run into
+  per-line execution counts) and kept only if they save issue slots;
+  `--ifconvert-all` forces them.
+
+Output: `../../../build/starbug2_phase2/results.md`.

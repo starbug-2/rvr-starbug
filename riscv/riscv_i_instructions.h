@@ -104,6 +104,18 @@ void RiscVISh(const Instruction* instruction);
 void RiscVISb(const Instruction* instruction);
 
 void RiscVExVLIW(const Instruction* instruction);
+// STARBUG2 execute packet: runs the children attached by the VLIW decoder,
+// skipping any whose predicate is false.
+void RiscVExStarbugPacket(const Instruction* instruction);
+// STARBUG2 post-increment loads/stores: access at rs1, then rs1 += imm.
+void RiscVStarbugLbPi(const Instruction* instruction);
+void RiscVStarbugLhPi(const Instruction* instruction);
+void RiscVStarbugLwPi(const Instruction* instruction);
+void RiscVStarbugLbuPi(const Instruction* instruction);
+void RiscVStarbugLhuPi(const Instruction* instruction);
+void RiscVStarbugSbPi(const Instruction* instruction);
+void RiscVStarbugShPi(const Instruction* instruction);
+void RiscVStarbugSwPi(const Instruction* instruction);
 
 }  // namespace RV32
 

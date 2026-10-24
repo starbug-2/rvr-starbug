@@ -44,6 +44,19 @@ instruction group RiscVIInstBase32[32] : Inst32Format {
   // RV32I Base Instruction Set
   lui    : UType  : opcode == 0b011'0111, rd != 0;
   auipc  : UType  : opcode == 0b001'0111, rd != 0;
+  // STARBUG2 execute-packet header (custom-0). The fields are read by the
+  // VLIW decoder; see riscv32_vliw_decoder.cc.
+  starbug_hdr : Inst32Format : opcode == 0b000'1011;
+  // STARBUG2 post-increment loads/stores (custom-1, placeholder encoding):
+  // access at rs1, then rs1 += imm. funct3 selects the width.
+  lb_pi  : BType : func3 == 0b000, opcode == 0b010'1011;
+  lh_pi  : BType : func3 == 0b001, opcode == 0b010'1011;
+  lw_pi  : BType : func3 == 0b010, opcode == 0b010'1011;
+  lbu_pi : BType : func3 == 0b100, opcode == 0b010'1011;
+  lhu_pi : BType : func3 == 0b101, opcode == 0b010'1011;
+  sw_pi  : SType : func3 == 0b011, opcode == 0b010'1011;
+  sb_pi  : SType : func3 == 0b110, opcode == 0b010'1011;
+  sh_pi  : SType : func3 == 0b111, opcode == 0b010'1011;
   jal    : JType  : rd != 0, opcode == 0b110'1111;
   j      : JType  : rd == 0, opcode == 0b110'1111;
   jalr   : IType  : rd != 0, func3 == 0b000, opcode == 0b110'0111;
